@@ -1,7 +1,7 @@
 {
-  "name": "langfuse-observability",
-  "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "1.0.0",
+  "name": "langfuse-observability-custom",
+  "description": "The Langfuse x Claude Code Observability Plugin (fork: adds Workflow-tool subagent capture)",
+  "version": "1.0.1",
   "author": {
     "name": "Langfuse"
   },

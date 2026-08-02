@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -864,17 +865,38 @@ def is_async_agent_launch_result(tool_result_entry: Any) -> bool:
         )
     )
 
+
+def is_workflow_launch_result(tool_result_entry: Any) -> bool:
+    """True for a Workflow tool result that launched a background run.
+
+    Like async agents, the Workflow tool returns immediately and notifies on
+    completion (the notification carries this tool's tool-use-id). Deferring the
+    launching turn until then lets the run's subagent transcripts land on disk
+    before we emit, so they can be nested under the Workflow tool span.
+    """
+    if not isinstance(tool_result_entry, dict):
+        return False
+    return extract_workflow_run_id(get_tool_result_text(tool_result_entry)) is not None
+
 def get_pending_agent_tool_use_ids(turn: Turn) -> List[str]:
     tool_use_ids: List[str] = []
     for assistant_message in turn.assistant_msgs:
         for tool_use_block in get_tool_use_blocks(get_content_from_row(assistant_message)):
-            if tool_use_block.get("name") not in ("Agent", "Task"):
+            name = tool_use_block.get("name")
+            if name not in ("Agent", "Task", "Workflow"):
                 continue
             tool_use_id = str(tool_use_block.get("id") or "")
             if not tool_use_id:
                 continue
             tool_result_entry = turn.tool_results_by_id.get(tool_use_id)
             if isinstance(tool_result_entry, dict) and tool_result_entry.get("final_content") is not None:
+                continue
+            # Fork addition: defer the Workflow launching turn until its
+            # completion notification (which carries this tool-use-id) arrives,
+            # so the run's subagent transcripts exist on disk when we emit.
+            if name == "Workflow":
+                if is_workflow_launch_result(tool_result_entry):
+                    tool_use_ids.append(tool_use_id)
                 continue
             # Defer only explicit async launches: sync agents also write a
             # subagent transcript but never notify, so deferring on transcript
@@ -1306,6 +1328,103 @@ def get_task_id_to_tool_use_id(
         if isinstance(agent_id, str) and agent_id:
             task_id_to_tool_use_id[agent_id] = tool_use_id
     return task_id_to_tool_use_id
+
+
+# ----------------- Workflow subagent discovery (fork addition) -----------------
+# The Workflow tool spawns its agents into
+#   <transcript>/subagents/workflows/<runId>/agent-*.jsonl
+# which the upstream discovery misses: it is one directory deeper than the flat
+# subagents/*.meta.json glob, the meta.json carries no `toolUseId`, and the
+# launcher tool is `Workflow`, not `Agent`/`Task`. We discover them keyed by
+# runId and attach them under the Workflow tool span at emit time.
+_WORKFLOW_SUBAGENTS_BY_RUN_ID: Dict[str, List[Dict[str, Any]]] = {}
+
+_WF_RUN_ID_LABELLED = re.compile(r"Run ID:\s*(wf_[A-Za-z0-9-]+)")
+_WF_RUN_ID_BARE = re.compile(r"\bwf_[0-9A-Za-z]+(?:-[0-9A-Za-z]+)*\b")
+
+
+def _derive_workflow_agent_label(jsonl_path: Path) -> Optional[str]:
+    """Cheap human label for a workflow agent: first line of its first user prompt."""
+    try:
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("type") != "user":
+                continue
+            content = row.get("message", {}).get("content")
+            text = content if isinstance(content, str) else extract_text_from_content(content)
+            if text and text.strip():
+                return " ".join(text.split())[:80]
+    except Exception:
+        pass
+    return None
+
+
+def get_workflow_subagents_by_run_id(transcript_path: Path) -> Dict[str, List[Dict[str, Any]]]:
+    """Map each Workflow runId to its list of subagent transcript descriptors."""
+    result: Dict[str, List[Dict[str, Any]]] = {}
+    workflows_root = transcript_path.with_suffix("") / "subagents" / "workflows"
+    if not workflows_root.is_dir():
+        return result
+
+    for run_dir in sorted(workflows_root.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        agents: List[Dict[str, Any]] = []
+        for meta_path in sorted(run_dir.glob("*.meta.json")):
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = {}
+            jsonl_path = meta_path.with_name(meta_path.name[: -len(".meta.json")] + ".jsonl")
+            if not jsonl_path.exists():
+                continue
+            agent_id = meta_path.name[: -len(".meta.json")]
+            if agent_id.startswith("agent-"):
+                agent_id = agent_id[len("agent-"):]
+            agents.append({
+                "path": jsonl_path,
+                "agent_id": agent_id,
+                "agent_type": metadata.get("agentType"),
+                "description": _derive_workflow_agent_label(jsonl_path),
+            })
+        if agents:
+            result[run_dir.name] = agents
+    return result
+
+
+def extract_workflow_run_id(tool_output: Any) -> Optional[str]:
+    """Pull the `wf_...` runId out of a Workflow tool result."""
+    if tool_output is None:
+        return None
+    text = tool_output if isinstance(tool_output, str) else json.dumps(tool_output, ensure_ascii=False, default=str)
+    labelled = _WF_RUN_ID_LABELLED.search(text)
+    if labelled:
+        return labelled.group(1)
+    bare = _WF_RUN_ID_BARE.search(text)
+    return bare.group(0) if bare else None
+
+
+def emit_workflow_subagents(
+    langfuse: Langfuse,
+    parent_otel_span: Any,
+    subagents: List[Dict[str, Any]],
+) -> Optional[datetime]:
+    """Expand each workflow subagent transcript under parent_otel_span.
+
+    Passes start_timestamp=None so each agent is backdated to its own recorded
+    first-message timestamp rather than a shared launch time.
+    """
+    latest_end_timestamp: Optional[datetime] = None
+    for subagent in subagents:
+        end_ts = emit_subagent_observations(langfuse, parent_otel_span, subagent, None)
+        latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, end_ts)
+    return latest_end_timestamp
 
 
 # ----------------- Langfuse emit -----------------
@@ -1767,7 +1886,22 @@ def emit_single_tool_observation(
                     tool_use_timestamp,
                 )
 
-    tool_end_timestamp = _get_latest_timestamp(tool_result.result_timestamp, tool_use_timestamp)
+    # Fork addition: attach Workflow-tool subagents nested under this tool span.
+    if tool_name == "Workflow" and _WORKFLOW_SUBAGENTS_BY_RUN_ID:
+        run_id = extract_workflow_run_id(tool_result.output)
+        workflow_subagents = _WORKFLOW_SUBAGENTS_BY_RUN_ID.get(run_id) if run_id else None
+        if workflow_subagents:
+            debug(f"Attaching {len(workflow_subagents)} workflow subagent(s) for run {run_id}")
+            workflow_end_timestamp = emit_workflow_subagents(
+                langfuse,
+                tool_span._otel_span,
+                workflow_subagents,
+            )
+            subagent_end_timestamp = _get_latest_timestamp(subagent_end_timestamp, workflow_end_timestamp)
+
+    tool_end_timestamp = _get_latest_timestamp(
+        tool_result.result_timestamp, tool_use_timestamp, subagent_end_timestamp
+    )
     handoff_timestamp = (
         tool_result.result_timestamp
         or tool_result.final_result_timestamp
@@ -2554,6 +2688,13 @@ def emit_new_turns_from_transcript(
         subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
         if subagent_transcripts_by_tool_use_id:
             debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
+
+        global _WORKFLOW_SUBAGENTS_BY_RUN_ID
+        _WORKFLOW_SUBAGENTS_BY_RUN_ID = get_workflow_subagents_by_run_id(transcript_path)
+        if _WORKFLOW_SUBAGENTS_BY_RUN_ID:
+            total = sum(len(v) for v in _WORKFLOW_SUBAGENTS_BY_RUN_ID.values())
+            debug(f"Discovered {total} workflow subagent(s) across "
+                  f"{len(_WORKFLOW_SUBAGENTS_BY_RUN_ID)} run(s)")
 
         turns, session_state = get_new_turns_from_transcript(
             transcript_path,

@@ -1,15 +1,15 @@
 {
-  "name": "langfuse-observability",
-  "description": "Langfuse observability plugin for Claude Code — captures and exports traces, spans, and session telemetry from Claude Code to Langfuse for LLM monitoring, debugging, and evaluation",
+  "name": "langfuse-custom",
+  "description": "Fork marketplace: Langfuse observability plugin with Workflow-tool subagent capture",
   "owner": {
     "name": "Langfuse",
     "url": "https://langfuse.com"
   },
   "plugins": [
     {
-      "name": "langfuse-observability",
+      "name": "langfuse-observability-custom",
       "source": "./",
-      "description": "Instruments Claude Code sessions with OpenTelemetry-compatible tracing and sends trace data to Langfuse, enabling visibility into model calls, token usage, latency, and agent execution flow"
+      "description": "Instruments Claude Code sessions and, in addition to upstream, captures agents spawned by the Workflow tool (subagents/workflows/<runId>/) nested under the Workflow tool span."
     }
   ]
 }
