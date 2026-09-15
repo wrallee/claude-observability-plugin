@@ -58,6 +58,10 @@ secret key is held in your OS keychain, not in a file.
 `/plugin configure` also lists the optional settings, such as the user ID,
 debug logging, and image capture, with their defaults.
 
+`LANGFUSE_TIMEOUT` sets the Langfuse request timeout in seconds (default `30`).
+`CC_LANGFUSE_FLUSH_TIMEOUT` sets the shutdown wait in seconds (default:
+`LANGFUSE_TIMEOUT + 5`, normally `35`).
+
 ## Updating
 
 Automatic updates are off for marketplaces outside Anthropic's, so you run the
