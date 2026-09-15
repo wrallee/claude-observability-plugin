@@ -28,6 +28,18 @@
       "description": "Langfuse host. Use https://us.cloud.langfuse.com for US, https://cloud.langfuse.com for EU, or your self-hosted URL.",
       "default": "https://cloud.langfuse.com"
     },
+    "LANGFUSE_TIMEOUT": {
+      "type": "number",
+      "title": "Langfuse request timeout",
+      "description": "Timeout in seconds for Langfuse API requests",
+      "default": 30
+    },
+    "CC_LANGFUSE_FLUSH_TIMEOUT": {
+      "type": "number",
+      "title": "Langfuse shutdown timeout",
+      "description": "Maximum seconds to wait for pending traces during hook shutdown. Defaults to LANGFUSE_TIMEOUT plus 5 seconds.",
+      "default": 35
+    },
     "LANGFUSE_USER_ID": {
       "type": "string",
       "title": "User ID",

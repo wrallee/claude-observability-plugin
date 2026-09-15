@@ -97,6 +97,8 @@ value is a per-run environment variable.
 | `LANGFUSE_SECRET_KEY` | Your Langfuse secret key (`sk-lf-...`). Held in your OS keychain. | Yes |
 | `LANGFUSE_PUBLIC_KEY` | Your Langfuse public key (`pk-lf-...`). | Yes |
 | `LANGFUSE_BASE_URL` | Langfuse host. EU: `https://cloud.langfuse.com`, US: `https://us.cloud.langfuse.com`, or your self-hosted URL. | No (defaults to EU) |
+| `LANGFUSE_TIMEOUT` | Langfuse API request timeout in seconds (default `30`). | No |
+| `CC_LANGFUSE_FLUSH_TIMEOUT` | Maximum seconds the hook waits while flushing and shutting down (default: `LANGFUSE_TIMEOUT + 5`, normally `35`). | No |
 | `LANGFUSE_USER_ID` | User identifier attached to every trace, shown as the user in Langfuse. | No |
 | `CC_LANGFUSE_DEBUG` | Verbose logging to the hook log (default `false`). | No |
 | `CC_LANGFUSE_MAX_CHARS` | Truncate captured inputs and outputs to this many characters (default `20000`). | No |

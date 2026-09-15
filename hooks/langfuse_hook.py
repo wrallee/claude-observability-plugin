@@ -41,6 +41,8 @@ SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
+DEFAULT_LANGFUSE_TIMEOUT_SECONDS = 30
+LANGFUSE_SHUTDOWN_GRACE_SECONDS = 5
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -342,6 +344,29 @@ def info(msg: str) -> None:
         except Exception:
             pass
 
+def get_positive_timeout_seconds(name: str, default: int) -> int:
+    raw = _opt(name).strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        info(f"Ignoring invalid {name}={raw!r}; using {default}s")
+        return default
+
+def get_langfuse_timeout_seconds() -> int:
+    return get_positive_timeout_seconds("LANGFUSE_TIMEOUT", DEFAULT_LANGFUSE_TIMEOUT_SECONDS)
+
+def get_langfuse_shutdown_timeout_seconds() -> int:
+    request_timeout = get_langfuse_timeout_seconds()
+    return get_positive_timeout_seconds(
+        "CC_LANGFUSE_FLUSH_TIMEOUT",
+        request_timeout + LANGFUSE_SHUTDOWN_GRACE_SECONDS,
+    )
+
 
 # ----------------- Langfuse import (fail-open) -----------------
 # Everything above this guard runs before the SDK import and must stay
@@ -376,6 +401,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
+            timeout=get_langfuse_timeout_seconds(),
         )
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
@@ -3462,18 +3488,16 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
     if langfuse is None:
         return
 
-    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+    # Langfuse.shutdown() flushes pending spans before stopping its workers.
+    # Give that request a grace period beyond the SDK request timeout while
+    # still bounding how long an unreachable endpoint can stall Claude Code.
     try:
-        def _flush_and_shutdown():
-            try:
-                langfuse.flush()
-            except Exception:
-                pass
-            langfuse.shutdown()
-
-        t = threading.Thread(target=_flush_and_shutdown, daemon=True)
+        timeout = get_langfuse_shutdown_timeout_seconds()
+        t = threading.Thread(target=langfuse.shutdown, daemon=True)
         t.start()
-        t.join(5.0)
+        t.join(float(timeout))
+        if t.is_alive():
+            info(f"Langfuse shutdown exceeded {timeout}s; pending traces may be dropped")
     except Exception:
         pass
 
