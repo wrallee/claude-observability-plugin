@@ -39,7 +39,10 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
-CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+def capture_images_enabled() -> bool:
+    return (_opt("LANGFUSE_CAPTURE_IMAGES") or _opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+
+CAPTURE_IMAGES = capture_images_enabled()
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 DEFAULT_LANGFUSE_TIMEOUT_SECONDS = 30
 LANGFUSE_SHUTDOWN_GRACE_SECONDS = 5
@@ -392,9 +395,8 @@ except Exception:
     LangfuseMedia = None
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
-    # With capture off, stop the SDK from uploading base64 images it finds
-    # in span payloads on its own. The SDK reads an empty value as enabled.
-    if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
+    # Stop SDK auto-uploads too, even if its separate setting was enabled.
+    if not CAPTURE_IMAGES:
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
     try:
         return Langfuse(
