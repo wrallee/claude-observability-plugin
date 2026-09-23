@@ -12,6 +12,15 @@ def image_block(data: str = PNG_B64, media_type: str = "image/png") -> dict:
     return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
 
 
+def test_shared_capture_images_env_overrides_legacy(hook_module, monkeypatch):
+    monkeypatch.setenv("LANGFUSE_CAPTURE_IMAGES", "false")
+    monkeypatch.setenv("CC_LANGFUSE_CAPTURE_IMAGES", "true")
+    assert hook_module.capture_images_enabled() is False
+
+    monkeypatch.delenv("LANGFUSE_CAPTURE_IMAGES")
+    assert hook_module.capture_images_enabled() is True
+
+
 # ---- text extraction (direct message content) ----
 
 def test_extract_text_replaces_image_blocks_with_markers(hook_module):
@@ -191,12 +200,13 @@ def test_capture_on_leaves_sdk_media_upload_untouched(hook_module, monkeypatch):
     assert "LANGFUSE_MEDIA_UPLOAD_ENABLED" not in os.environ
 
 
-def test_user_set_media_upload_setting_wins_over_hardening(hook_module, monkeypatch):
+def test_capture_off_overrides_sdk_media_upload_setting(hook_module, monkeypatch):
+    monkeypatch.setattr(hook_module, "CAPTURE_IMAGES", False)
     monkeypatch.setenv("LANGFUSE_MEDIA_UPLOAD_ENABLED", "true")
 
     hook_module.create_langfuse_client(_config(hook_module))
 
-    assert os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] == "true"
+    assert os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] == "false"
 
 
 # ---- turn root input ----

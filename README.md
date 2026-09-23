@@ -62,6 +62,10 @@ debug logging, and image capture, with their defaults.
 `CC_LANGFUSE_FLUSH_TIMEOUT` sets the shutdown wait in seconds (default:
 `LANGFUSE_TIMEOUT + 5`, normally `35`).
 
+`LANGFUSE_CAPTURE_IMAGES` controls image uploads (default `true`) and takes
+precedence over the legacy `CC_LANGFUSE_CAPTURE_IMAGES` setting. Set it to
+`false` to keep image markers without uploading media.
+
 ## Updating
 
 Automatic updates are off for marketplaces outside Anthropic's, so you run the
