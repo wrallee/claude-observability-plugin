@@ -66,6 +66,12 @@ debug logging, and image capture, with their defaults.
 precedence over the legacy `CC_LANGFUSE_CAPTURE_IMAGES` setting. Set it to
 `false` to keep image markers without uploading media.
 
+The `StopFailure` command hook exports API failures, including quota errors,
+without calling a Claude model. A failure is exported while background agents
+are still running. Later hooks attach their completed observations beneath the
+same turn in the same trace. The root retains the failure output and end time
+captured at export.
+
 ## Updating
 
 Automatic updates are off for marketplaces outside Anthropic's, so you run the

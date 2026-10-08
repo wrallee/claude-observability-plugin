@@ -1579,6 +1579,107 @@ def drop_rows_copied_from_another_session(
     return [row for row in rows if not is_row_from_another_session(row, session_id)]
 
 
+def reconcile_stop_failure_fallbacks(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Replace a buffered failure with its delayed transcript row, retaining its emission key."""
+    merged: List[Dict[str, Any]] = []
+    fallbacks: List[int] = []
+    replaced = set()
+    failure_order = max((row.get("stop_failure_order", 0) for row in rows), default=0)
+    for row in rows:
+        if (get_user_or_assistant_role_from_row(row) == "user"
+                and not row.get("isMeta") and not is_interrupted_turn_row(row)
+                and not is_tool_result(row) and not is_task_notification_row(row)):
+            fallbacks.clear()
+        status = get_api_error_status(row)
+        fallback_index = None
+        if (status is not None and not row.get("stop_failure_fallback")
+                and "stop_failure_order" not in row):
+            for index in fallbacks:
+                candidate = merged[index]
+                if row.get("error") and candidate.get("error"):
+                    matches = row["error"] == candidate["error"]
+                else:
+                    matches = not row.get("error") or status == get_api_error_status(candidate)
+                if matches:
+                    fallback_index = index
+                    break
+        if row.get("stop_failure_fallback"):
+            if status is not None:
+                fallbacks.append(len(merged))
+        elif fallback_index is not None:
+            fallbacks.remove(fallback_index)
+            fallback = merged[fallback_index]
+            row = dict(row)
+            row["uuid"] = fallback["uuid"]
+            row["message"] = dict(row["message"], id=get_message_id(fallback))
+            row["stop_failure_order"] = fallback.get("stop_failure_order", 0)
+            row["stop_failure_status_message"] = get_api_error_status(fallback)[1]
+            row["stop_failure_prompt_id"] = fallback.get("stop_failure_prompt_id")
+            if not row.get("error"):
+                row["error"] = fallback.get("error")
+            replaced.add(fallback_index)
+        elif status is not None and "stop_failure_order" not in row:
+            failure_order += 1
+            row = dict(row, stop_failure_order=failure_order)
+        merged.append(row)
+    return [row for index, row in enumerate(merged) if index not in replaced]
+
+
+def supplement_stop_failure(
+    rows: List[Dict[str, Any]], payload: Dict[str, Any],
+    task_id_to_tool_use_id: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """Capture the hook's error when asynchronous transcript writes have not caught up."""
+    _, trailing_turn, trailing_rows = assemble_turns(rows, task_id_to_tool_use_id)
+    if not trailing_rows:
+        return rows
+    error = payload.get("error") or "unknown"
+    text = payload.get("last_assistant_message") or payload.get("error_details") or f"API Error: {error}"
+    status_text = build_status_message(text, f"API Error: {error}")
+    if trailing_turn is not None:
+        candidates = [assistant for assistant in reversed(trailing_turn.assistant_msgs)
+                      if get_api_error_status(assistant) is not None]
+        if candidates:
+            # Transcript arrival order can differ from the hook's failure order.
+            latest = max(candidates, key=lambda row: row.get("stop_failure_order", 0))
+            status = get_api_error_status(latest)
+            same_error = (not payload.get("error") or not latest.get("error")
+                          or latest["error"] == error)
+            prompt_id = payload.get("prompt_id")
+            previous_prompt_id = latest.get("stop_failure_prompt_id")
+            new_prompt = prompt_id and previous_prompt_id and prompt_id != previous_prompt_id
+            same_prompt = prompt_id and prompt_id == previous_prompt_id
+            last_is_error = get_api_error_status(trailing_turn.assistant_msgs[-1]) is not None
+            # Pending errors may receive their preceding response in a later batch.
+            can_reuse = not new_prompt and (last_is_error or latest.get("stop_failure_fallback") or same_prompt)
+            if can_reuse and same_error and (
+                not (payload.get("last_assistant_message") or payload.get("error_details"))
+                or status[1] == status_text
+                or latest.get("stop_failure_status_message") == status_text
+            ):
+                for row in trailing_rows:
+                    if get_message_id(row) == get_message_id(latest):
+                        if not latest.get("error") and payload.get("error"):
+                            row["error"] = payload["error"]
+                        if prompt_id:
+                            row["stop_failure_prompt_id"] = prompt_id
+                return rows
+    failure_order = max((row.get("stop_failure_order", 0) for row in rows), default=0) + 1
+    key = hashlib.sha256(
+        f"{trailing_rows[0].get('uuid')}:{trailing_rows[-1].get('uuid')}:{error}:{status_text}:{failure_order}".encode()
+    ).hexdigest()
+    failure_row = {
+        "type": "assistant", "uuid": f"stop-failure:{key}",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "isApiErrorMessage": True, "error": error, "stop_failure_fallback": True,
+        "stop_failure_order": failure_order,
+        "stop_failure_prompt_id": payload.get("prompt_id"),
+        "message": {"id": f"stop-failure:{key}", "role": "assistant",
+                    "content": [{"type": "text", "text": text}]},
+    }
+    return rows + [failure_row]
+
+
 def get_new_turns_from_transcript(
     transcript_path: Path,
     session_state: SessionState,
@@ -1586,6 +1687,7 @@ def get_new_turns_from_transcript(
     *,
     flush_deferred_agent_turns: bool = False,
     session_id: Optional[str] = None,
+    stop_failure: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Turn], SessionState]:
     rows, session_state = read_new_jsonl(transcript_path, session_state)
     task_id_to_tool_use_id = get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id)
@@ -1612,6 +1714,10 @@ def get_new_turns_from_transcript(
     if isinstance(held_rows, list) and held_rows:
         rows = held_rows + rows
         session_state.open_turn = {}
+
+    rows = reconcile_stop_failure_fallbacks(rows)
+    if stop_failure is not None:
+        rows = supplement_stop_failure(rows, stop_failure, task_id_to_tool_use_id)
 
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
@@ -2782,7 +2888,8 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
         # The trailing message needs no extra guard: Stop only fires after a
         # response is fully written, and no message.id ever grows across a
         # Stop boundary (0 cases across all local transcripts).
-        generation_complete = (
+        # API failures are complete even while launched agents keep running.
+        generation_complete = get_api_error_status(assistant_message) is not None or (
             not unresolved_async_launch_seen
             and all(
                 str(tool_use.get("id") or "") in turn.tool_results_by_id
@@ -3377,8 +3484,9 @@ def emit_ready_observations_of_open_turn(
     parent_context: Optional[Tuple[str, str]] = None,
     workflow_agent_transcripts_by_run_id: Optional[WorkflowAgentTranscriptsByRunId] = None,
     session_history: Optional[SessionHistory] = None,
+    emit_failed_open_turn: bool = False,
 ) -> None:
-    """Emit the held open turn once its async activity is provably resolved.
+    """Emit the held open turn after async completion or an API failure.
 
     Agent-less turns pass the gate at their own Stop and ship immediately;
     turns with async activity ship at the first Stop after every agent
@@ -3387,6 +3495,9 @@ def emit_ready_observations_of_open_turn(
     progress advances in session_state.turn_progress. Exported roots are
     final — if a turn grows after a clean Stop, later firings still add
     children, but the root's output/end time stay as emitted.
+
+    StopFailure exports the failure snapshot immediately. Progress and held
+    rows remain available so late agent results join the same root.
     """
     held_rows = session_state.open_turn.get("rows") if isinstance(session_state.open_turn, dict) else None
     if not isinstance(held_rows, list) or not held_rows:
@@ -3394,7 +3505,7 @@ def emit_ready_observations_of_open_turn(
     _, trailing_turn, _ = assemble_turns(held_rows, task_id_to_tool_use_id)
     if trailing_turn is None:
         return
-    if turn_has_unresolved_async_activity(trailing_turn):
+    if turn_has_unresolved_async_activity(trailing_turn) and not emit_failed_open_turn:
         # The turn provably continues (pending agent result or queued,
         # undelivered notification). Emitting now would freeze a wrong root
         # output forever; everything ships at the first clean Stop instead.
@@ -3438,6 +3549,7 @@ def emit_new_turns_from_transcript(
     transcript_path: Path,
     *,
     flush_deferred_agent_turns: bool = False,
+    stop_failure: Optional[Dict[str, Any]] = None,
 ) -> int:
     key = get_session_state_key(session_id, str(transcript_path))
 
@@ -3458,6 +3570,7 @@ def emit_new_turns_from_transcript(
             subagent_transcripts_by_tool_use_id,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
             session_id=session_id,
+            stop_failure=stop_failure,
         )
 
         # One full-file pass per firing serves every turn emitted below.
@@ -3491,9 +3604,8 @@ def emit_new_turns_from_transcript(
 
         session_state.turn_count += emitted
 
-        # The still-open trailing turn ships once its async activity is
-        # provably resolved (agent-less turns: at their own Stop); until
-        # then its rows keep being held and nothing is emitted.
+        # Stop waits for async completion; StopFailure ships the error snapshot
+        # while retaining the open turn for late results and later firings.
         emit_ready_observations_of_open_turn(
             langfuse,
             session_id,
@@ -3506,6 +3618,7 @@ def emit_new_turns_from_transcript(
             parent_context=config.parent_context,
             workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
             session_history=session_history,
+            emit_failed_open_turn=stop_failure is not None,
         )
 
         # Known limitation (accepted, like the crash-between-emit-and-save
@@ -3559,6 +3672,9 @@ def main() -> int:
 
     session_id, transcript_path = hook_context
     flush_deferred_agent_turns = is_session_end_hook_payload(payload)
+    is_stop_failure = (
+        payload.get("hook_event_name") or payload.get("hookEventName")
+    ) == "StopFailure"
 
     langfuse = create_langfuse_client(config)
     if langfuse is None:
@@ -3571,6 +3687,7 @@ def main() -> int:
             session_id,
             transcript_path,
             flush_deferred_agent_turns=flush_deferred_agent_turns,
+            stop_failure=payload if is_stop_failure else None,
         )
 
         dur = time.time() - start
