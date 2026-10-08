@@ -34,6 +34,8 @@ _ACTIVE_SPAN_STACK: list[Any] = []
 
 
 def _install_langfuse_stubs() -> None:
+    # Keep the SDK's header parser real when tracing itself is stubbed.
+    importlib.import_module("opentelemetry.util.re")
     langfuse_module = types.ModuleType("langfuse")
 
     class Langfuse:

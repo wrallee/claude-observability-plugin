@@ -72,6 +72,31 @@ are still running. Later hooks attach their completed observations beneath the
 same turn in the same trace. The root retains the failure output and end time
 captured at export.
 
+Trace delivery uses batches of at most 4 MiB, measured after OTLP encoding.
+Set `LANGFUSE_OTEL_MAX_BATCH_SIZE_BYTES` to override that byte limit. Inputs,
+outputs and conversation history keep their existing capture settings; batch
+splitting does not truncate them. A single observation above the limit stops
+delivery and logs the reason instead of consuming the session's progress.
+
+Pending batches are stored under the state directory's `langfuse_delivery/`
+directory. The next hook for that session retries them with their original
+trace IDs, span IDs and parent relationships. Batches with persisted
+acknowledgements are not sent again, and session progress advances only after
+delivery succeeds. An interrupted response or acknowledgement write can cause
+a batch to be replayed with the same observation IDs. Exactly-once delivery
+is not guaranteed. Deleting or resetting session state can generate new span
+IDs when the transcript is processed again; preserve state during retries.
+Files are replaced atomically but are not fsynced; recovery after an OS crash
+or sudden power loss is not guaranteed. Interrupted cleanup after delivery
+does not block subsequent hooks. The
+delivery directory contains captured trace data and is private to the user;
+it does not store the secret key. Both SDK shutdown and pending delivery use
+the `CC_LANGFUSE_FLUSH_TIMEOUT` wait limit.
+
+Forked subagents can inherit the parent conversation, including their own
+launch call. That history stays in generation inputs; only the subagent's
+own work creates observations. Nested agents remain beneath their parent.
+
 ## Updating
 
 Automatic updates are off for marketplaces outside Anthropic's, so you run the

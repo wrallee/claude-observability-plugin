@@ -20,6 +20,12 @@ import sys
 import threading
 import time
 import hashlib
+import gzip
+import shutil
+import ssl
+import tempfile
+import urllib.request
+from importlib.metadata import version as package_version
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -46,6 +52,7 @@ CAPTURE_IMAGES = capture_images_enabled()
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 DEFAULT_LANGFUSE_TIMEOUT_SECONDS = 30
 LANGFUSE_SHUTDOWN_GRACE_SECONDS = 5
+DEFAULT_MAX_BATCH_BYTES = 4 * 1024 * 1024
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
 except ValueError:
@@ -399,12 +406,16 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     if not CAPTURE_IMAGES:
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
     try:
-        return Langfuse(
+        exporter = BufferedSpanExporter()
+        client = Langfuse(
             public_key=config.public_key,
             secret_key=config.secret_key,
             host=config.host,
             timeout=get_langfuse_timeout_seconds(),
+            span_exporter=exporter,
         )
+        client._cc_delivery_exporter = exporter
+        return client
     except Exception as e:
         info(f"Langfuse client creation failed ({type(e).__name__}: {e}); tracing disabled for this turn")
         return None
@@ -624,7 +635,7 @@ def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
             pass
 
 
-def save_hook_state(state: Dict[str, Any]) -> None:
+def save_hook_state(state: Dict[str, Any]) -> bool:
     try:
         # Drop session entries older than 30 days to keep the file bounded.
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
@@ -646,12 +657,234 @@ def save_hook_state(state: Dict[str, Any]) -> None:
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, STATE_FILE)
+        return True
     except Exception as e:
         debug(f"save_hook_state failed: {e}")
+        return False
 
 def save_session_state(global_state: Dict[str, Any], key: str, session_state: SessionState) -> None:
     update_session_state(global_state, key, session_state)
-    save_hook_state(global_state)
+    if not save_hook_state(global_state):
+        raise OSError("Could not save session state; delivery checkpoint retained")
+
+
+# ----------------- Retryable trace delivery -----------------
+def get_langfuse_max_batch_bytes() -> int:
+    raw = _opt("LANGFUSE_OTEL_MAX_BATCH_SIZE_BYTES")
+    if raw.isascii() and raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return DEFAULT_MAX_BATCH_BYTES
+
+
+def serialize_span_batch(spans: Any) -> bytes:
+    from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+    return encode_spans(spans).SerializePartialToString()
+
+
+def run_with_timeout(callback: Any, timeout: float, name: str) -> Any:
+    results: List[Any] = []
+    failures: List[Exception] = []
+    def run() -> None:
+        try:
+            results.append(callback())
+        except Exception as exc:
+            failures.append(exc)
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError(f"{name} exceeded {timeout}s")
+    if failures:
+        raise failures[0]
+    return results[0]
+
+
+class BufferedSpanExporter:
+    """Stage exact OTLP payloads so a retry keeps span ids and parentage."""
+
+    def __init__(self, max_batch_bytes: Optional[int] = None) -> None:
+        self.max_batch_bytes = max_batch_bytes or get_langfuse_max_batch_bytes()
+        self.directory: Optional[Path] = None
+        self.batch_count = 0
+        self.error: Optional[Exception] = None
+        self.observations_ended = 0
+
+    def before_observation_end(self, langfuse: Langfuse) -> None:
+        # Drain ended spans before the SDK's bounded queue can drop them.
+        # This flush only stages payloads; delivery waits for the full turn.
+        queue_size = int(os.environ.get("OTEL_BSP_MAX_QUEUE_SIZE", "2048"))
+        interval = max(1, min(128, queue_size // 2))
+        self.observations_ended += 1
+        if self.observations_ended % interval == 0:
+            timeout = get_langfuse_shutdown_timeout_seconds()
+            provider = otel_trace_api.get_tracer_provider()
+            if not run_with_timeout(
+                lambda: provider.force_flush(timeout_millis=int(timeout * 1000)),
+                timeout, "Span queue flush",
+            ):
+                raise TimeoutError("Span queue flush failed; session progress retained")
+
+    def stage(self, spans: Any) -> None:
+        if not spans:
+            return
+        payload = serialize_span_batch(spans)
+        if len(payload) > self.max_batch_bytes:
+            if len(spans) == 1:
+                raise ValueError(
+                    f"A single observation exceeds the {self.max_batch_bytes}-byte batch limit; "
+                    "reduce captured input/output or increase LANGFUSE_OTEL_MAX_BATCH_SIZE_BYTES"
+                )
+            middle = len(spans) // 2
+            self.stage(spans[:middle])
+            self.stage(spans[middle:])
+            return
+        if self.directory is None:
+            base = STATE_DIR / "langfuse_delivery"
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.directory = Path(tempfile.mkdtemp(prefix="staging-", dir=base))
+        (self.directory / f"batch-{self.batch_count:06d}.bin").write_bytes(payload)
+        self.batch_count += 1
+
+    def export(self, spans: Any) -> Any:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+        try:
+            self.stage(spans)
+            return SpanExportResult.SUCCESS
+        except Exception as exc:
+            self.error = exc
+            info(f"Trace serialization failed: {type(exc).__name__}: {exc}")
+            return SpanExportResult.FAILURE
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self.error is None
+
+    def discard(self) -> None:
+        if self.directory is not None and self.directory.exists():
+            shutil.rmtree(self.directory)
+
+
+def end_observation(langfuse: Langfuse, observation: Any, *, end_time: Optional[int]) -> None:
+    exporter = getattr(langfuse, "_cc_delivery_exporter", None)
+    if exporter is not None:
+        exporter.before_observation_end(langfuse)
+    observation.end(end_time=end_time)
+
+
+def get_pending_delivery_path(key: str) -> Path:
+    return STATE_DIR / "langfuse_delivery" / key
+
+
+def write_delivery_manifest(path: Path, manifest: Dict[str, Any]) -> None:
+    temporary = path / "manifest.tmp"
+    temporary.write_text(json.dumps(manifest), encoding="utf-8")
+    os.replace(temporary, path / "manifest.json")
+
+
+def prepare_pending_delivery(
+    key: str, config: LangfuseConfig, session_state: SessionState,
+    exporter: BufferedSpanExporter,
+) -> None:
+    if exporter.directory is None:
+        return
+    snapshot: Dict[str, Any] = {}
+    update_session_state(snapshot, key, session_state)
+    manifest = {
+        "host": config.host.rstrip("/"), "public_key": config.public_key,
+        "session_state": snapshot[key],
+        "pending_batches": [f"batch-{index:06d}.bin" for index in range(exporter.batch_count)],
+    }
+    write_delivery_manifest(exporter.directory, manifest)
+    exporter.directory.rename(get_pending_delivery_path(key))
+
+
+def send_trace_batch(config: LangfuseConfig, payload: bytes, timeout: float) -> None:
+    from opentelemetry.util.re import parse_env_headers
+    auth = base64.b64encode(f"{config.public_key}:{config.secret_key}".encode()).decode("ascii")
+    headers = {"content-type": "application/x-protobuf",
+               "user-agent": "OTel-OTLP-Exporter-Python/" + package_version("opentelemetry-exporter-otlp-proto-http")}
+    headers.update(parse_env_headers(
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+        or os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""), liberal=True,
+    ))
+    headers.update({"authorization": f"Basic {auth}",
+                    "x-langfuse-sdk-name": "python",
+                    "x-langfuse-sdk-version": package_version("langfuse"),
+                    "x-langfuse-public-key": config.public_key})
+    compression = _opt("LANGFUSE_OTEL_COMPRESSION").strip().lower()
+    if compression not in ("gzip", "none"):
+        compression = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION")
+                       or os.environ.get("OTEL_EXPORTER_OTLP_COMPRESSION") or "none").lower()
+    if compression == "gzip":
+        payload = gzip.compress(payload, mtime=0)
+        headers["Content-Encoding"] = "gzip"
+    export_path = (os.environ.get("LANGFUSE_OTEL_TRACES_EXPORT_PATH")
+                   or "api/public/otel/v1/traces")
+    ca_file = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE")
+               or os.environ.get("OTEL_EXPORTER_OTLP_CERTIFICATE")
+               or os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE"))
+    tls_context = ssl.create_default_context(cafile=ca_file)
+    client_certificate = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE")
+                          or os.environ.get("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE"))
+    if client_certificate:
+        client_key = (os.environ.get("OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY")
+                      or os.environ.get("OTEL_EXPORTER_OTLP_CLIENT_KEY"))
+        tls_context.load_cert_chain(client_certificate, keyfile=client_key)
+    request = urllib.request.Request(
+        config.host.rstrip("/") + "/" + export_path,
+        data=payload, method="POST",
+        headers=headers,
+    )
+    class NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                             hdrs: Any, newurl: str) -> None:
+            return None
+    opener = urllib.request.build_opener(NoRedirects(), urllib.request.HTTPSHandler(context=tls_context))
+    def post() -> bytes:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read()
+    body = run_with_timeout(post, timeout, "Trace HTTP request")
+    if body:
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
+        result = ExportTraceServiceResponse.FromString(body)
+        if result.partial_success.rejected_spans:
+            raise RuntimeError(f"Langfuse rejected {result.partial_success.rejected_spans} observation(s)")
+
+
+def finish_pending_delivery(key: str, config: LangfuseConfig) -> None:
+    path = get_pending_delivery_path(key)
+    if not path.exists():
+        return
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    if (manifest["host"] != config.host.rstrip("/")
+            or manifest["public_key"] != config.public_key):
+        raise ValueError("Pending trace delivery belongs to another Langfuse project")
+    deadline = time.monotonic() + get_langfuse_shutdown_timeout_seconds()
+    while manifest["pending_batches"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Trace delivery deadline exceeded; pending batches retained")
+        filename = manifest["pending_batches"][0]
+        send_trace_batch(config, (path / filename).read_bytes(),
+                         min(get_langfuse_timeout_seconds(), remaining))
+        manifest["pending_batches"].pop(0)
+        write_delivery_manifest(path, manifest)
+        (path / filename).unlink()
+    # The session lock held by the caller protects the snapshot; merge under
+    # the global lock so another session's progress cannot be overwritten.
+    with FileLock(LOCK_FILE):
+        state = load_hook_state()
+        save_session_state(state, key, get_session_state({key: manifest["session_state"]}, key))
+    # Detach the completed checkpoint before deleting its contents. An
+    # interrupted cleanup must not leave an active path without a manifest.
+    completed = path.with_name(f"delivered-{key}-{random.getrandbits(128):032x}")
+    path.rename(completed)
+    try:
+        shutil.rmtree(completed)
+    except OSError as exc:
+        info(f"Completed delivery cleanup failed ({completed}): {type(exc).__name__}: {exc}")
 
 
 # ----------------- Transcript row parsing -----------------
@@ -2605,7 +2838,7 @@ def emit_single_tool_observation(
         or assistant_timestamp
     )
     if tool_span is not None:
-        tool_span.end(end_time=to_otel_nanoseconds(tool_end_timestamp))
+        end_observation(langfuse, tool_span, end_time=to_otel_nanoseconds(tool_end_timestamp))
 
     if tool_result.final_result_timestamp is not None and tool_result.final_output is not None:
         pending_async_tool_results.append({
@@ -2938,7 +3171,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             generation_start_timestamp,
         )
         if generation_span is not None:
-            generation_span.end(end_time=to_otel_nanoseconds(generation_end_timestamp))
+            end_observation(langfuse, generation_span, end_time=to_otel_nanoseconds(generation_end_timestamp))
         latest_end_timestamp = _get_latest_timestamp(
             latest_end_timestamp,
             generation_end_timestamp,
@@ -3127,7 +3360,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             previous_start_timestamp = latest_turn_timestamp
 
     subagent_span.update(output={"role": "assistant", "content": subagent_output_text})
-    subagent_span.end(
+    end_observation(langfuse, subagent_span,
         end_time=to_otel_nanoseconds(
             _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
         )
@@ -3421,7 +3654,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
             # The root exports exactly once: end time and output are the
             # values known now, and stay — exported fields are immutable.
             trace_span.update(output=build_turn_output_payload(turn))
-            trace_span.end(
+            end_observation(langfuse, trace_span,
                 end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts))
             )
     progress["emitted_keys"] = sorted(cursor.emitted)
@@ -3459,7 +3692,6 @@ def emit_and_close_ready_turns(
         max(session_state.turn_numbers.values(), default=0),
     )
     for turn in turns_to_emit:
-        emitted += 1
         turn_num = session_state.turn_numbers.get(turn.user_msg.get("uuid"))
         if turn_num is None:
             turn_num = next_fallback_turn_number
@@ -3491,6 +3723,8 @@ def emit_and_close_ready_turns(
             # Log at INFO so SDK incompatibilities (and other emit failures)
             # are visible without needing CC_LANGFUSE_DEBUG=true.
             info(f"emit_turn failed: {type(e).__name__}: {e}")
+            raise
+        emitted += 1
     return emitted
 
 
@@ -3564,6 +3798,7 @@ def emit_ready_observations_of_open_turn(
         session_state.turn_progress[user_row_uuid] = progress
     except Exception as e:
         info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
+        raise
 
 def emit_new_turns_from_transcript(
     langfuse: Langfuse,
@@ -3577,6 +3812,7 @@ def emit_new_turns_from_transcript(
     key = get_session_state_key(session_id, str(transcript_path))
 
     with FileLock(get_session_lock_path(key)):
+        finish_pending_delivery(key, config)
         with FileLock(LOCK_FILE):
             state = load_hook_state()
         session_state = get_session_state(state, key)
@@ -3644,33 +3880,58 @@ def emit_new_turns_from_transcript(
             emit_failed_open_turn=stop_failure is not None,
         )
 
-        # Known limitation (accepted, like the crash-between-emit-and-save
-        # duplicate window): progress is persisted before the SDK flush in
-        # main(); a dropped flush leaves emitted_keys pointing at spans that
-        # never reached the server.
-        with FileLock(LOCK_FILE):
-            state = load_hook_state()
-            save_session_state(state, key, session_state)
+        exporter = getattr(langfuse, "_cc_delivery_exporter", None)
+        if exporter is not None:
+            if not flush_and_shutdown_langfuse_client(langfuse):
+                raise TimeoutError("Langfuse shutdown failed; session state retained")
+            if exporter.error is not None:
+                raise exporter.error
+            prepare_pending_delivery(key, config, session_state, exporter)
+            if get_pending_delivery_path(key).exists():
+                finish_pending_delivery(key, config)
+            else:
+                with FileLock(LOCK_FILE):
+                    state = load_hook_state()
+                    save_session_state(state, key, session_state)
+        else:
+            with FileLock(LOCK_FILE):
+                state = load_hook_state()
+                save_session_state(state, key, session_state)
 
     return emitted
 
 
-def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
+def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> bool:
     if langfuse is None:
-        return
+        return True
+    if getattr(langfuse, "_cc_shutdown_complete", False):
+        return True
 
     # Langfuse.shutdown() flushes pending spans before stopping its workers.
     # Give that request a grace period beyond the SDK request timeout while
     # still bounding how long an unreachable endpoint can stall Claude Code.
     try:
         timeout = get_langfuse_shutdown_timeout_seconds()
-        t = threading.Thread(target=langfuse.shutdown, daemon=True)
+        failures: List[Exception] = []
+        def shutdown() -> None:
+            try:
+                langfuse.shutdown()
+            except Exception as exc:
+                failures.append(exc)
+        t = threading.Thread(target=shutdown, daemon=True)
         t.start()
         t.join(float(timeout))
         if t.is_alive():
             info(f"Langfuse shutdown exceeded {timeout}s; pending traces may be dropped")
-    except Exception:
-        pass
+            return False
+        if failures:
+            info(f"Langfuse shutdown failed: {type(failures[0]).__name__}: {failures[0]}")
+            return False
+        langfuse._cc_shutdown_complete = True
+        return True
+    except Exception as exc:
+        info(f"Langfuse shutdown failed: {type(exc).__name__}: {exc}")
+        return False
 
 
 # ----------------- Main -----------------
@@ -3718,15 +3979,19 @@ def main() -> int:
         return 0
 
     except TimeoutError as e:
-        info(f"lock timeout, skipping: {e}")
+        reason = "lock timeout" if str(e).startswith("could not acquire") else "hook timeout"
+        info(f"{reason}; session progress retained for retry: {e}")
         return 0
 
     except Exception as e:
-        debug(f"Unexpected failure: {e}")
+        info(f"Hook failed; session progress retained for retry: {type(e).__name__}: {e}")
         return 0
 
     finally:
         flush_and_shutdown_langfuse_client(langfuse)
+        exporter = getattr(langfuse, "_cc_delivery_exporter", None)
+        if exporter is not None and getattr(langfuse, "_cc_shutdown_complete", False):
+            exporter.discard()
 
 if __name__ == "__main__":
     sys.exit(main())
