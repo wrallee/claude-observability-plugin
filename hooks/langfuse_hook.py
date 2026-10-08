@@ -2091,7 +2091,7 @@ def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
     one per completed agent; unparseable lines are skipped."""
     journal_path = run_dir / "journal.jsonl"
     try:
-        lines = journal_path.read_text(encoding="utf-8").splitlines()
+        lines = journal_path.read_text(encoding="utf-8").split("\n")
     except Exception:
         return {}
     results_by_agent_id: Dict[str, Any] = {}
@@ -3370,7 +3370,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
 
 def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = path.read_text(encoding="utf-8").split("\n")
     except Exception as e:
         info(f"transcript read failed ({path}): {type(e).__name__}: {e}")
         return None
