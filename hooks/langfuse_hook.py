@@ -1845,6 +1845,7 @@ def get_subagent_transcripts_by_tool_use_id(transcript_path: Path) -> Dict[str, 
         subagent_transcripts_by_tool_use_id[tool_use_id] = {
             "path": jsonl_path,
             "agent_id": agent_id,
+            "tool_use_id": tool_use_id,
             "agent_type": metadata.get("agentType"),
             "description": metadata.get("description"),
         }
@@ -3043,6 +3044,28 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     if rows is None:
         return start_timestamp
 
+    # Forked agents copy their parent's messages, including the call that
+    # launched them. Keep that prefix as model context, not agent work.
+    inherited_history: List[Dict[str, Any]] = []
+    launch_id = subagent.get("tool_use_id")
+    if launch_id:
+        for index, row in enumerate(rows):
+            content = get_content_from_row(row)
+            if isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                and block.get("id") == launch_id for block in content
+            ):
+                for inherited_turn in build_turns(rows[:index + 1]):
+                    inherited_history.extend(build_turn_history_messages(inherited_turn))
+                rows = rows[index + 1:]
+                break
+
+    # Removing every alias of this path also blocks A -> B -> A: each
+    # descendant receives a map without any of its ancestors.
+    nested_subagents = {
+        key: value for key, value in (subagent_transcripts_by_tool_use_id or {}).items()
+        if not isinstance(value.get("path"), Path) or value["path"].resolve() != path.resolve()
+    }
     turns = build_turns(rows)
     if not turns:
         return start_timestamp
@@ -3086,7 +3109,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     previous_start_timestamp = subagent_start_timestamp
     # The agent transcript is complete on disk, so history accumulates
     # across its turns the same way as in the main conversation.
-    subagent_history: List[Dict[str, Any]] = []
+    subagent_history: List[Dict[str, Any]] = inherited_history
     for turn in turns:
         latest_turn_timestamp = emit_turn_observations(
             langfuse,
@@ -3095,7 +3118,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             previous_start_timestamp,
             generation_name=generation_name,
             # Agents launched by this agent are listed in the same map.
-            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            subagent_transcripts_by_tool_use_id=nested_subagents,
             history_prefix=list(subagent_history),
         )
         subagent_history.extend(build_turn_history_messages(turn))
