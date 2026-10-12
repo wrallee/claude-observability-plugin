@@ -842,13 +842,34 @@ def send_trace_batch(config: LangfuseConfig, payload: bytes, timeout: float) -> 
                              hdrs: Any, newurl: str) -> None:
             return None
     opener = urllib.request.build_opener(NoRedirects(), urllib.request.HTTPSHandler(context=tls_context))
-    def post() -> bytes:
+    def post() -> Tuple[bytes, str]:
         with opener.open(request, timeout=timeout) as response:
-            return response.read()
-    body = run_with_timeout(post, timeout, "Trace HTTP request")
+            return response.read(), response.headers.get_content_type()
+    body, content_type = run_with_timeout(post, timeout, "Trace HTTP request")
     if body:
         from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
-        result = ExportTraceServiceResponse.FromString(body)
+        if content_type == "application/json":
+            from google.protobuf.json_format import Parse
+            def reject_constant(value: str) -> None:
+                raise ValueError(f"Invalid JSON constant: {value}")
+            data = json.loads(body, parse_constant=reject_constant)
+            if not isinstance(data, dict):
+                raise ValueError("Expected a JSON trace acknowledgement object")
+            partial = data.get("partialSuccess")
+            if ("partial_success" in data
+                    or (partial is not None and not isinstance(partial, dict))
+                    or (isinstance(partial, dict) and ("rejected_spans" in partial or "error_message" in partial))):
+                raise ValueError("Invalid OTLP JSON partial success acknowledgement")
+            is_job = (data.get("name") == "otel-ingestion-job"
+                      and isinstance(data.get("id"), str) and bool(data["id"].strip()))
+            if "error" in data or (data and not is_job
+                                  and "partialSuccess" not in data):
+                raise ValueError("Unrecognized Langfuse JSON acknowledgement")
+            # Langfuse can acknowledge queue admission with a JSON job.
+            # Parse OTLP fields even on job responses so rejection is not hidden.
+            result = Parse(body, ExportTraceServiceResponse(), ignore_unknown_fields=True)
+        else:
+            result = ExportTraceServiceResponse.FromString(body)
         if result.partial_success.rejected_spans:
             raise RuntimeError(f"Langfuse rejected {result.partial_success.rejected_spans} observation(s)")
 

@@ -1,0 +1,35 @@
+{
+  "name": "otel-ingestion-job",
+  "id": "queued-job-1",
+  "data": {
+    "id": "a9bdfbde-962b-40ad-9a13-74c8c09770f8",
+    "timestamp": "2026-10-12T04:44:00.000Z",
+    "name": "otel-ingestion-job",
+    "payload": {
+      "data": {
+        "fileKey": "otel/test-project/2026/10/12/04/44/request.json",
+        "publicKey": "pk-lf-sdk-test"
+      },
+      "authCheck": {
+        "validKey": true,
+        "scope": {
+          "projectId": "test-project",
+          "accessLevel": "project",
+          "orgId": "test-org"
+        }
+      },
+      "sdkName": "python",
+      "sdkVersion": "4.17.0"
+    }
+  },
+  "opts": {"attempts": 6, "removeOnComplete": true},
+  "progress": 0,
+  "attemptsMade": 0,
+  "attemptsStarted": 0,
+  "stalledCounter": 0,
+  "timestamp": 1791780240000,
+  "stacktrace": [],
+  "returnvalue": null,
+  "queueQualifiedName": "bull:otel-ingestion-queue",
+  "priority": 0
+}

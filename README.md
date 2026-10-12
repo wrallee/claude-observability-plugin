@@ -93,6 +93,10 @@ delivery directory contains captured trace data and is private to the user;
 it does not store the secret key. Both SDK shutdown and pending delivery use
 the `CC_LANGFUSE_FLUSH_TIMEOUT` wait limit.
 
+Delivery accepts OTLP protobuf and JSON acknowledgements, including Langfuse's
+JSON ingestion job response. Rejected observations, malformed responses and
+unrecognized JSON responses retain pending batches and session progress.
+
 Forked subagents can inherit the parent conversation, including their own
 launch call. That history stays in generation inputs; only the subagent's
 own work creates observations. Nested agents remain beneath their parent.

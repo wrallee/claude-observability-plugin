@@ -23,9 +23,12 @@ def sdk_delivery(tmp_path):
 
         def do_POST(self):
             payload = self.rfile.read(int(self.headers["Content-Length"]))
-            code, body = responses.pop(0) if responses else (200, b"")
+            reply = responses.pop(0) if responses else (200, b"")
+            code, body = reply[:2]
+            content_type = reply[2] if len(reply) == 3 else "application/x-protobuf"
             requests.append((code, payload, body))
             self.send_response(code)
+            self.send_header("Content-Type", content_type)
             self.end_headers()
             self.wfile.write(body)
 
@@ -157,6 +160,63 @@ def test_real_sdk_serialization_failure_does_not_consume_the_turn(sdk_delivery):
     fire()
     assert requests
     assert state_file.read_bytes() != before
+
+
+@pytest.mark.parametrize("body", [
+    b"{}",
+    (Path(__file__).parents[1] / "fixtures/otel_responses/langfuse_ingestion_job.json").read_bytes(),
+    b'{"partialSuccess":{"rejectedSpans":"0","errorMessage":"warning"}}',
+    b'{"partialSuccess":null,"futureField":null}',
+    b'{"partialSuccess":{"rejectedSpans":0,"futureWarning":"NaN"},"futureField":true}',
+], ids=["empty", "langfuse-job", "warning", "null", "future-fields"])
+def test_json_acknowledgement_commits_progress_without_resending(sdk_delivery, body):
+    fire, requests, responses, state_file, state_dir, _ = sdk_delivery
+    responses.append((200, body, "application/json; charset=utf-8"))
+    fire()
+    state = json.loads(state_file.read_text())
+    assert state.pop("unrelated") == {"offset": 7}
+    assert len(state) == 1
+    assert next(iter(state.values()))["turn_count"] == 3
+    assert not list((state_dir / "langfuse_delivery").glob("*/manifest.json"))
+    cores = decode_core([payload for code, payload, _ in requests if code == 200])
+    assert len(cores) == len({s["id"] for s in cores}) == 6
+    count = len(requests)
+    fire()
+    assert len(requests) == count
+
+
+@pytest.mark.parametrize("body", [
+    b'{"partialSuccess":{"rejectedSpans":"1","errorMessage":"rejected"}}',
+    b'{"partialSuccess":{"rejectedSpans":1},"name":"otel-ingestion-job","id":"job-1"}',
+    b'{"partialSuccess":{"rejectedSpans":"invalid"}}',
+    b'{"partialSuccess":[]}',
+    b'{"partialSuccess":{"rejectedSpans":"1","rejected_spans":"0"}}',
+    b'{"partialSuccess":{"rejectedSpans":"1"},"partial_success":{"rejected_spans":"0"}}',
+    b'{"partialSuccess":{"rejectedSpans":"1"},"partialSuccess":{"rejectedSpans":"0"}}',
+    b'{"partialSuccess":{"rejectedSpans":"1","rejectedSpans":"0"}}',
+    b'{"error":"ingestion failed"}',
+    b'{"name":"otel-ingestion-job","id":""}',
+    b'{"name":"otel-ingestion-job","id":" "}',
+    b'{"name":"otel-ingestion-job","id":123}',
+    b'{"name":"unrelated-job","id":"job-1"}',
+    b"{bad-json",
+    b"[]",
+    b'{"partialSuccess":{},"newField":NaN}',
+    b'{"name":"otel-ingestion-job","id":"job-1","data":Infinity}',
+    b'{"partialSuccess":{},"newField":-Infinity}',
+])
+def test_bad_json_acknowledgement_keeps_the_batch_and_session_state(sdk_delivery, body):
+    fire, requests, responses, state_file, state_dir, _ = sdk_delivery
+    before = state_file.read_bytes()
+    responses.append((200, body, "application/json"))
+    fire()
+    assert state_file.read_bytes() == before
+    assert len(list((state_dir / "langfuse_delivery").glob("*/manifest.json"))) == 1
+    failed = requests[0][1]
+    fire()
+    assert requests[1][1] == failed
+    cores = decode_core([payload for code, payload, response in requests if code == 200 and not response])
+    assert len(cores) == len({s["id"] for s in cores}) == 6
 
 
 def test_real_sdk_rejected_spans_keep_the_original_batch_for_retry(sdk_delivery):
