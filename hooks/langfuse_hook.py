@@ -3282,6 +3282,46 @@ def emit_workflow_agent_observations(
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, agent_end_timestamp)
     return latest_end_timestamp
 
+def split_subagent_transcript(
+    rows: List[Dict[str, Any]], launch_id: Optional[str],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Separate inherited context from work, preserving the fork's directive."""
+    if not launch_id:
+        return rows, []
+    for index, row in enumerate(rows):
+        launch = next((block for block in get_tool_use_blocks(get_content_from_row(row))
+                       if block.get("id") == launch_id), None)
+        if launch is None:
+            continue
+        inherited = rows[:index + 1]
+        own = rows[index + 1:]
+        if own and get_user_or_assistant_role_from_row(own[0]) == "user":
+            startup_content = get_content_from_row(own[0])
+            startup_results = get_tool_result_blocks(startup_content)
+            if any(block.get("tool_use_id") == launch_id for block in startup_results):
+                # The first fork row combines the inherited launch result and
+                # the worker directive. Turn assembly treats mixed rows as
+                # tool results, so separate them at the inheritance boundary.
+                directive = [block for block in startup_content
+                             if not isinstance(block, dict) or block.get("type") != "tool_result"]
+                if not directive:
+                    launch_input = launch.get("input")
+                    prompt = launch_input.get("prompt") if isinstance(launch_input, dict) else None
+                    if isinstance(prompt, str) and prompt:
+                        directive = [{"type": "text", "text": prompt}]
+                if directive:
+                    startup = own[0]
+                    message = startup.get("message")
+                    if isinstance(message, dict):
+                        inherited.append({**startup, "message": {**message, "content": startup_results}})
+                        own[0] = {**startup, "message": {**message, "content": directive}}
+                    else:
+                        inherited.append({**startup, "content": startup_results})
+                        own[0] = {**startup, "content": directive}
+        return own, inherited
+    return rows, []
+
+
 def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                subagent: Dict[str, Any],
                                start_timestamp: Optional[datetime],
@@ -3301,18 +3341,9 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     # Forked agents copy their parent's messages, including the call that
     # launched them. Keep that prefix as model context, not agent work.
     inherited_history: List[Dict[str, Any]] = []
-    launch_id = subagent.get("tool_use_id")
-    if launch_id:
-        for index, row in enumerate(rows):
-            content = get_content_from_row(row)
-            if isinstance(content, list) and any(
-                isinstance(block, dict) and block.get("type") == "tool_use"
-                and block.get("id") == launch_id for block in content
-            ):
-                for inherited_turn in build_turns(rows[:index + 1]):
-                    inherited_history.extend(build_turn_history_messages(inherited_turn))
-                rows = rows[index + 1:]
-                break
+    rows, inherited_rows = split_subagent_transcript(rows, subagent.get("tool_use_id"))
+    for inherited_turn in build_turns(inherited_rows):
+        inherited_history.extend(build_turn_history_messages(inherited_turn))
 
     # Removing every alias of this path also blocks A -> B -> A: each
     # descendant receives a map without any of its ancestors.
